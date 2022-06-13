@@ -13,6 +13,11 @@
 #include <chrono>
 #include <cmath>
 #include <bitset>
+#include <system_error>
+#include <unordered_map>
+#include <iterator>
+#include <type_traits>
+#include <algorithm>
 
 namespace msgpack {
 enum class UnpackerError {
@@ -91,6 +96,16 @@ enum FormatConstants : uint8_t {
 };
 
 template<class T>
+struct is_timepoint {
+  static const bool value = false;
+};
+
+template<class Clock, class Duration>
+struct is_timepoint<std::chrono::time_point<Clock, Duration>> {
+  static const bool value = true;
+};
+
+template<class T>
 struct is_container {
   static const bool value = false;
 };
@@ -144,6 +159,12 @@ template<class T, class Alloc>
 struct is_map<std::unordered_map<T, Alloc> > {
   static const bool value = true;
 };
+
+template<class It, class T = void>
+using is_random_access_iterator_t = std::enable_if_t<std::is_convertible_v<typename std::iterator_traits<It>::iterator_category, std::random_access_iterator_tag>, T>;
+
+template<class It, class T = void>
+using is_not_random_access_iterator_t = std::enable_if_t<!std::is_convertible_v<typename std::iterator_traits<It>::iterator_category, std::random_access_iterator_tag>, T>;
 
 class Packer {
  public:
@@ -502,12 +523,32 @@ void Packer::pack_type(const std::vector<uint8_t> &value) {
   }
 }
 
+template<class InputIt>
+class Unpacker;
+template<class InputIt, class T>
+struct UnpackerImpl {
+  static void unpack_type(Unpacker<InputIt> &u, T &value);
+
+  static void unpack_timepoint(Unpacker<InputIt> &u, T &value);
+
+  static void unpack_array(Unpacker<InputIt> &u, T &array);
+
+  static void unpack_stdarray(Unpacker<InputIt> &u, T &array);
+
+  static void unpack_map(Unpacker<InputIt> &u, T &map);
+};
+
+template<class InputIt>
 class Unpacker {
+  static_assert(std::is_convertible_v<typename std::iterator_traits<InputIt>::iterator_category, std::input_iterator_tag>);
  public:
+  template<class I, class T>
+  friend struct UnpackerImpl;
+
   Unpacker() : data_pointer(nullptr), data_end(nullptr) {};
 
-  Unpacker(const uint8_t *data_start, std::size_t bytes)
-      : data_pointer(data_start), data_end(data_start + bytes) {};
+  Unpacker(InputIt start, InputIt end)
+      : data_pointer(start), data_end(end) {};
 
   template<class ... Types>
   void operator()(Types &... args) {
@@ -527,357 +568,441 @@ class Unpacker {
   std::error_code ec{};
 
  private:
-  const uint8_t *data_pointer;
-  const uint8_t *data_end;
+  InputIt data_pointer;
+  InputIt data_end;
 
   uint8_t safe_data() {
-    if (data_pointer < data_end)
+    if (data_pointer != data_end)
       return *data_pointer;
     ec = UnpackerError::OutOfRange;
     return 0;
   }
 
-  void safe_increment(int64_t bytes = 1) {
-    if (data_end - data_pointer >= 0) {
+  template<class I = InputIt>
+  is_random_access_iterator_t<I> safe_increment(int64_t bytes = 1) {
+    if (data_end - data_pointer >= bytes) {
       data_pointer += bytes;
     } else {
       ec = UnpackerError::OutOfRange;
     }
   }
 
+  template<class I = InputIt>
+  is_not_random_access_iterator_t<I> safe_increment(int64_t bytes = 1) {
+    for (int64_t i = 0; i < bytes; i++) {
+      if (data_pointer != data_end) {
+        data_pointer++;
+      } else {
+        ec = UnpackerError::OutOfRange;
+        break;
+      }
+    }
+  }
+
+  template<class Container, class I = InputIt>
+  is_random_access_iterator_t<I> safe_append(Container &c, int64_t bytes) {
+    if (std::distance(data_pointer, data_end) >= bytes) {
+      c.insert(c.end(), data_pointer, data_pointer + bytes);
+      data_pointer += bytes;
+    } else {
+      ec = UnpackerError::OutOfRange;
+    }
+  }
+
+  template<class Container, class I = InputIt>
+  is_not_random_access_iterator_t<I> safe_append(Container &c, int64_t bytes) {
+    size_t i;
+    for (i = 0; i < bytes && data_pointer != data_end; i++, data_pointer++) {
+      c.push_back(*data_pointer);
+    }
+    if (i != bytes) {
+      ec = UnpackerError::OutOfRange;
+    }
+  }
+
   template<class T>
   void unpack_type(T &value) {
-    if constexpr(is_map<T>::value) {
-      unpack_map(value);
-    } else if constexpr (is_container<T>::value) {
-      unpack_array(value);
-    } else if constexpr (is_stdarray<T>::value) {
-      unpack_stdarray(value);
-    } else {
-      auto recursive_data = std::vector<uint8_t>{};
-      unpack_type(recursive_data);
-
-      auto recursive_unpacker = Unpacker{recursive_data.data(), recursive_data.size()};
-      value.pack(recursive_unpacker);
-      ec = recursive_unpacker.ec;
-    }
-  }
-
-  template<class Clock, class Duration>
-  void unpack_type(std::chrono::time_point<Clock, Duration> &value) {
-    using RepType = typename std::chrono::time_point<Clock, Duration>::rep;
-    using DurationType = Duration;
-    using TimepointType = typename std::chrono::time_point<Clock, Duration>;
-    auto placeholder = RepType{};
-    unpack_type(placeholder);
-    value = TimepointType(DurationType(placeholder));
-  }
-
-  template<class T>
-  void unpack_array(T &array) {
-    using ValueType = typename T::value_type;
-    if (safe_data() == array32) {
-      safe_increment();
-      std::size_t array_size = 0;
-      for (auto i = sizeof(uint32_t); i > 0; --i) {
-        array_size += uint32_t(safe_data()) << 8 * (i - 1);
-        safe_increment();
-      }
-      std::vector<uint32_t> x{};
-      for (auto i = 0U; i < array_size; ++i) {
-        ValueType val{};
-        unpack_type(val);
-        array.emplace_back(val);
-      }
-    } else if (safe_data() == array16) {
-      safe_increment();
-      std::size_t array_size = 0;
-      for (auto i = sizeof(uint16_t); i > 0; --i) {
-        array_size += uint16_t(safe_data()) << 8 * (i - 1);
-        safe_increment();
-      }
-      for (auto i = 0U; i < array_size; ++i) {
-        ValueType val{};
-        unpack_type(val);
-        array.emplace_back(val);
-      }
-    } else {
-      std::size_t array_size = safe_data() & 0b00001111;
-      safe_increment();
-      for (auto i = 0U; i < array_size; ++i) {
-        ValueType val{};
-        unpack_type(val);
-        array.emplace_back(val);
-      }
-    }
-  }
-
-  template<class T>
-  void unpack_stdarray(T &array) {
-    using ValueType = typename T::value_type;
-    auto vec = std::vector<ValueType>{};
-    unpack_array(vec);
-    std::copy(vec.begin(), vec.end(), array.begin());
-  }
-
-  template<class T>
-  void unpack_map(T &map) {
-    using KeyType = typename T::key_type;
-    using MappedType = typename T::mapped_type;
-    if (safe_data() == map32) {
-      safe_increment();
-      std::size_t map_size = 0;
-      for (auto i = sizeof(uint32_t); i > 0; --i) {
-        map_size += uint32_t(safe_data()) << 8 * (i - 1);
-        safe_increment();
-      }
-      std::vector<uint32_t> x{};
-      for (auto i = 0U; i < map_size; ++i) {
-        KeyType key{};
-        MappedType value{};
-        unpack_type(key);
-        unpack_type(value);
-        map.insert_or_assign(key, value);
-      }
-    } else if (safe_data() == map16) {
-      safe_increment();
-      std::size_t map_size = 0;
-      for (auto i = sizeof(uint16_t); i > 0; --i) {
-        map_size += uint16_t(safe_data()) << 8 * (i - 1);
-        safe_increment();
-      }
-      for (auto i = 0U; i < map_size; ++i) {
-        KeyType key{};
-        MappedType value{};
-        unpack_type(key);
-        unpack_type(value);
-        map.insert_or_assign(key, value);
-      }
-    } else {
-      std::size_t map_size = safe_data() & 0b00001111;
-      safe_increment();
-      for (auto i = 0U; i < map_size; ++i) {
-        KeyType key{};
-        MappedType value{};
-        unpack_type(key);
-        unpack_type(value);
-        map.insert_or_assign(key, value);
-      }
-    }
+    UnpackerImpl<InputIt, T>::unpack_type(*this, value);
   }
 };
 
-template<>
-inline
-void Unpacker::unpack_type(int8_t &value) {
-  if (safe_data() == int8) {
-    safe_increment();
-    value = safe_data();
-    safe_increment();
+template<class InputIt, class T>
+void UnpackerImpl<InputIt, T>::unpack_type(Unpacker<InputIt> &u, T &value) {
+  if constexpr(is_timepoint<T>::value) {
+    unpack_timepoint(u, value);
+  } else if constexpr(is_map<T>::value) {
+    unpack_map(u, value);
+  } else if constexpr (is_container<T>::value) {
+    unpack_array(u, value);
+  } else if constexpr (is_stdarray<T>::value) {
+    unpack_stdarray(u, value);
   } else {
-    value = safe_data();
-    safe_increment();
+    auto recursive_data = std::vector<uint8_t>{};
+    u.unpack_type(recursive_data);
+
+    Unpacker<typename std::vector<uint8_t>::iterator> recursive_unpacker{recursive_data.begin(), recursive_data.end()};
+    value.pack(recursive_unpacker);
+    u.ec = recursive_unpacker.ec;
   }
 }
 
-template<>
+template<class InputIt, class T>
+void UnpackerImpl<InputIt, T>::unpack_timepoint(Unpacker<InputIt> &u, T &value) {
+  using RepType = typename std::chrono::time_point<typename T::clock, typename T::duration>::rep;
+  using DurationType = typename T::duration;
+  using TimepointType = typename std::chrono::time_point<typename T::clock, typename T::duration>;
+  auto placeholder = RepType{};
+  u.unpack_type(placeholder);
+  value = TimepointType(DurationType(placeholder));
+}
+
+template<class InputIt, class T>
+void UnpackerImpl<InputIt, T>::unpack_array(Unpacker<InputIt> &u, T &array) {
+  using ValueType = typename T::value_type;
+  if (u.safe_data() == array32) {
+    u.safe_increment();
+    std::size_t array_size = 0;
+    for (auto i = sizeof(uint32_t); i > 0; --i) {
+      array_size += uint32_t(u.safe_data()) << 8 * (i - 1);
+      u.safe_increment();
+    }
+    std::vector<uint32_t> x{};
+    for (auto i = 0U; i < array_size; ++i) {
+      ValueType val{};
+      u.unpack_type(val);
+      array.emplace_back(val);
+    }
+  } else if (u.safe_data() == array16) {
+    u.safe_increment();
+    std::size_t array_size = 0;
+    for (auto i = sizeof(uint16_t); i > 0; --i) {
+      array_size += uint16_t(u.safe_data()) << 8 * (i - 1);
+      u.safe_increment();
+    }
+    for (auto i = 0U; i < array_size; ++i) {
+      ValueType val{};
+      u.unpack_type(val);
+      array.emplace_back(val);
+    }
+  } else {
+    std::size_t array_size = u.safe_data() & 0b00001111;
+    u.safe_increment();
+    for (auto i = 0U; i < array_size; ++i) {
+      ValueType val{};
+      u.unpack_type(val);
+      array.emplace_back(val);
+    }
+  }
+}
+
+template<class InputIt, class T>
+void UnpackerImpl<InputIt, T>::unpack_stdarray(Unpacker<InputIt> &u, T &array) {
+  using ValueType = typename T::value_type;
+  auto vec = std::vector<ValueType>{};
+  UnpackerImpl<InputIt, std::vector<ValueType>>::unpack_array(u, vec);
+  std::copy(vec.begin(), vec.end(), array.begin());
+}
+
+template<class InputIt, class T>
+void UnpackerImpl<InputIt, T>::unpack_map(Unpacker<InputIt> &u, T &map) {
+  using KeyType = typename T::key_type;
+  using MappedType = typename T::mapped_type;
+  if (u.safe_data() == map32) {
+    u.safe_increment();
+    std::size_t map_size = 0;
+    for (auto i = sizeof(uint32_t); i > 0; --i) {
+      map_size += uint32_t(u.safe_data()) << 8 * (i - 1);
+      u.safe_increment();
+    }
+    std::vector<uint32_t> x{};
+    for (auto i = 0U; i < map_size; ++i) {
+      KeyType key{};
+      MappedType value{};
+      u.unpack_type(key);
+      u.unpack_type(value);
+      map.insert_or_assign(key, value);
+    }
+  } else if (u.safe_data() == map16) {
+    u.safe_increment();
+    std::size_t map_size = 0;
+    for (auto i = sizeof(uint16_t); i > 0; --i) {
+      map_size += uint16_t(u.safe_data()) << 8 * (i - 1);
+      u.safe_increment();
+    }
+    for (auto i = 0U; i < map_size; ++i) {
+      KeyType key{};
+      MappedType value{};
+      u.unpack_type(key);
+      u.unpack_type(value);
+      map.insert_or_assign(key, value);
+    }
+  } else {
+    std::size_t map_size = u.safe_data() & 0b00001111;
+    u.safe_increment();
+    for (auto i = 0U; i < map_size; ++i) {
+      KeyType key{};
+      MappedType value{};
+      u.unpack_type(key);
+      u.unpack_type(value);
+      map.insert_or_assign(key, value);
+    }
+  }
+}
+
+template<class InputIt>
+struct UnpackerImpl<InputIt, int8_t> {
+  static void unpack_type(Unpacker<InputIt> &u, int8_t &value);
+};
+template<class InputIt>
 inline
-void Unpacker::unpack_type(int16_t &value) {
-  if (safe_data() == int16) {
-    safe_increment();
+void UnpackerImpl<InputIt, int8_t>::unpack_type(Unpacker<InputIt> &u, int8_t &value) {
+  if (u.safe_data() == int8) {
+    u.safe_increment();
+    value = u.safe_data();
+    u.safe_increment();
+  } else {
+    value = u.safe_data();
+    u.safe_increment();
+  }
+}
+
+template<class InputIt>
+struct UnpackerImpl<InputIt, int16_t> {
+  static void unpack_type(Unpacker<InputIt> &u, int16_t &value);
+};
+template<class InputIt>
+inline
+void UnpackerImpl<InputIt, int16_t>::unpack_type(Unpacker<InputIt> &u, int16_t &value) {
+  if (u.safe_data() == int16) {
+    u.safe_increment();
     std::bitset<16> bits;
     for (auto i = sizeof(uint16_t); i > 0; --i) {
-      bits |= uint16_t(safe_data()) << 8 * (i - 1);
-      safe_increment();
+      bits |= uint16_t(u.safe_data()) << 8 * (i - 1);
+      u.safe_increment();
     }
     if (bits[15]) {
       value = -1 * (uint16_t((~bits).to_ulong()) + 1);
     } else {
       value = uint16_t(bits.to_ulong());
     }
-  } else if (safe_data() == int8) {
+  } else if (u.safe_data() == int8) {
     int8_t val;
-    unpack_type(val);
+    u.unpack_type(val);
     value = val;
   } else {
-    value = safe_data();
-    safe_increment();
+    value = u.safe_data();
+    u.safe_increment();
   }
 }
 
-template<>
+template<class InputIt>
+struct UnpackerImpl<InputIt, int32_t> {
+  static void unpack_type(Unpacker<InputIt> &u, int32_t &value);
+};
+template<class InputIt>
 inline
-void Unpacker::unpack_type(int32_t &value) {
-  if (safe_data() == int32) {
-    safe_increment();
+void UnpackerImpl<InputIt, int32_t>::unpack_type(Unpacker<InputIt> &u, int32_t &value) {
+  if (u.safe_data() == int32) {
+    u.safe_increment();
     std::bitset<32> bits;
     for (auto i = sizeof(uint32_t); i > 0; --i) {
-      bits |= uint32_t(safe_data()) << 8 * (i - 1);
-      safe_increment();
+      bits |= uint32_t(u.safe_data()) << 8 * (i - 1);
+      u.safe_increment();
     }
     if (bits[31]) {
       value = -1 * ((~bits).to_ulong() + 1);
     } else {
       value = bits.to_ulong();
     }
-  } else if (safe_data() == int16) {
+  } else if (u.safe_data() == int16) {
     int16_t val;
-    unpack_type(val);
+    u.unpack_type(val);
     value = val;
-  } else if (safe_data() == int8) {
+  } else if (u.safe_data() == int8) {
     int8_t val;
-    unpack_type(val);
+    u.unpack_type(val);
     value = val;
   } else {
-    value = safe_data();
-    safe_increment();
+    value = u.safe_data();
+    u.safe_increment();
   }
 }
 
-template<>
+template<class InputIt>
+struct UnpackerImpl<InputIt, int64_t> {
+  static void unpack_type(Unpacker<InputIt> &u, int64_t &value);
+};
+template<class InputIt>
 inline
-void Unpacker::unpack_type(int64_t &value) {
-  if (safe_data() == int64) {
-    safe_increment();
+void UnpackerImpl<InputIt, int64_t>::unpack_type(Unpacker<InputIt> &u, int64_t &value) {
+  if (u.safe_data() == int64) {
+    u.safe_increment();
     std::bitset<64> bits;
     for (auto i = sizeof(value); i > 0; --i) {
-      bits |= std::bitset<8>(safe_data()).to_ullong() << 8 * (i - 1);
-      safe_increment();
+      bits |= std::bitset<8>(u.safe_data()).to_ullong() << 8 * (i - 1);
+      u.safe_increment();
     }
     if (bits[63]) {
       value = -1 * ((~bits).to_ullong() + 1);
     } else {
       value = bits.to_ullong();
     }
-  } else if (safe_data() == int32) {
+  } else if (u.safe_data() == int32) {
     int32_t val;
-    unpack_type(val);
+    u.unpack_type(val);
     value = val;
-  } else if (safe_data() == int16) {
+  } else if (u.safe_data() == int16) {
     int16_t val;
-    unpack_type(val);
+    u.unpack_type(val);
     value = val;
-  } else if (safe_data() == int8) {
+  } else if (u.safe_data() == int8) {
     int8_t val;
-    unpack_type(val);
+    u.unpack_type(val);
     value = val;
   } else {
-    value = safe_data();
-    safe_increment();
+    value = u.safe_data();
+    u.safe_increment();
   }
 }
 
-template<>
+template<class InputIt>
+struct UnpackerImpl<InputIt, uint8_t> {
+  static void unpack_type(Unpacker<InputIt> &u, uint8_t &value);
+};
+template<class InputIt>
 inline
-void Unpacker::unpack_type(uint8_t &value) {
-  if (safe_data() == uint8) {
-    safe_increment();
-    value = safe_data();
-    safe_increment();
+void UnpackerImpl<InputIt, uint8_t>::unpack_type(Unpacker<InputIt> &u, uint8_t &value) {
+  if (u.safe_data() == uint8) {
+    u.safe_increment();
+    value = u.safe_data();
+    u.safe_increment();
   } else {
-    value = safe_data();
-    safe_increment();
+    value = u.safe_data();
+    u.safe_increment();
   }
 }
 
-template<>
+template<class InputIt>
+struct UnpackerImpl<InputIt, uint16_t> {
+  static void unpack_type(Unpacker<InputIt> &u, uint16_t &value);
+};
+template<class InputIt>
 inline
-void Unpacker::unpack_type(uint16_t &value) {
-  if (safe_data() == uint16) {
-    safe_increment();
+void UnpackerImpl<InputIt, uint16_t>::unpack_type(Unpacker<InputIt> &u, uint16_t &value) {
+  if (u.safe_data() == uint16) {
+    u.safe_increment();
     for (auto i = sizeof(uint16_t); i > 0; --i) {
-      value += safe_data() << 8 * (i - 1);
-      safe_increment();
+      value += u.safe_data() << 8 * (i - 1);
+      u.safe_increment();
     }
-  } else if (safe_data() == uint8) {
-    safe_increment();
-    value = safe_data();
-    safe_increment();
+  } else if (u.safe_data() == uint8) {
+    u.safe_increment();
+    value = u.safe_data();
+    u.safe_increment();
   } else {
-    value = safe_data();
-    safe_increment();
+    value = u.safe_data();
+    u.safe_increment();
   }
 }
 
-template<>
+template<class InputIt>
+struct UnpackerImpl<InputIt, uint32_t> {
+  static void unpack_type(Unpacker<InputIt> &u, uint32_t &value);
+};
+template<class InputIt>
 inline
-void Unpacker::unpack_type(uint32_t &value) {
-  if (safe_data() == uint32) {
-    safe_increment();
+void UnpackerImpl<InputIt, uint32_t>::unpack_type(Unpacker<InputIt> &u, uint32_t &value) {
+  if (u.safe_data() == uint32) {
+    u.safe_increment();
     for (auto i = sizeof(uint32_t); i > 0; --i) {
-      value += safe_data() << 8 * (i - 1);
-      safe_increment();
+      value += u.safe_data() << 8 * (i - 1);
+      u.safe_increment();
     }
-  } else if (safe_data() == uint16) {
-    safe_increment();
+  } else if (u.safe_data() == uint16) {
+    u.safe_increment();
     for (auto i = sizeof(uint16_t); i > 0; --i) {
-      value += safe_data() << 8 * (i - 1);
-      safe_increment();
+      value += u.safe_data() << 8 * (i - 1);
+      u.safe_increment();
     }
-  } else if (safe_data() == uint8) {
-    safe_increment();
-    value = safe_data();
-    safe_increment();
+  } else if (u.safe_data() == uint8) {
+    u.safe_increment();
+    value = u.safe_data();
+    u.safe_increment();
   } else {
-    value = safe_data();
-    safe_increment();
+    value = u.safe_data();
+    u.safe_increment();
   }
 }
 
-template<>
+template<class InputIt>
+struct UnpackerImpl<InputIt, uint64_t> {
+  static void unpack_type(Unpacker<InputIt> &u, uint64_t &value);
+};
+template<class InputIt>
 inline
-void Unpacker::unpack_type(uint64_t &value) {
-  if (safe_data() == uint64) {
-    safe_increment();
+void UnpackerImpl<InputIt, uint64_t>::unpack_type(Unpacker<InputIt> &u, uint64_t &value) {
+  if (u.safe_data() == uint64) {
+    u.safe_increment();
     for (auto i = sizeof(uint64_t); i > 0; --i) {
-      value += uint64_t(safe_data()) << 8 * (i - 1);
-      safe_increment();
+      value += uint64_t(u.safe_data()) << 8 * (i - 1);
+      u.safe_increment();
     }
-  } else if (safe_data() == uint32) {
-    safe_increment();
+  } else if (u.safe_data() == uint32) {
+    u.safe_increment();
     for (auto i = sizeof(uint32_t); i > 0; --i) {
-      value += uint64_t(safe_data()) << 8 * (i - 1);
-      safe_increment();
+      value += uint64_t(u.safe_data()) << 8 * (i - 1);
+      u.safe_increment();
     }
-    data_pointer++;
-  } else if (safe_data() == uint16) {
-    safe_increment();
+  } else if (u.safe_data() == uint16) {
+    u.safe_increment();
     for (auto i = sizeof(uint16_t); i > 0; --i) {
-      value += uint64_t(safe_data()) << 8 * (i - 1);
-      safe_increment();
+      value += uint64_t(u.safe_data()) << 8 * (i - 1);
+      u.safe_increment();
     }
-  } else if (safe_data() == uint8) {
-    safe_increment();
-    value = safe_data();
-    safe_increment();
+  } else if (u.safe_data() == uint8) {
+    u.safe_increment();
+    value = u.safe_data();
+    u.safe_increment();
   } else {
-    value = safe_data();
-    safe_increment();
+    value = u.safe_data();
+    u.safe_increment();
   }
 }
 
-template<>
+template<class InputIt>
+struct UnpackerImpl<InputIt, std::nullptr_t> {
+  static void unpack_type(Unpacker<InputIt> &u, std::nullptr_t &value);
+};
+template<class InputIt>
 inline
-void Unpacker::unpack_type(std::nullptr_t &/*value*/) {
-  safe_increment();
+void UnpackerImpl<InputIt, std::nullptr_t>::unpack_type(Unpacker<InputIt> &u, std::nullptr_t &/*value*/) {
+  u.safe_increment();
 }
 
-template<>
+template<class InputIt>
+struct UnpackerImpl<InputIt, bool> {
+  static void unpack_type(Unpacker<InputIt> &u, bool &value);
+};
+template<class InputIt>
 inline
-void Unpacker::unpack_type(bool &value) {
-  value = safe_data() != 0xc2;
-  safe_increment();
+void UnpackerImpl<InputIt, bool>::unpack_type(Unpacker<InputIt> &u, bool &value) {
+  value = u.safe_data() != 0xc2;
+  u.safe_increment();
 }
 
-template<>
+template<class InputIt>
+struct UnpackerImpl<InputIt, float> {
+  static void unpack_type(Unpacker<InputIt> &u, float &value);
+};
+template<class InputIt>
 inline
-void Unpacker::unpack_type(float &value) {
-  if (safe_data() == float32) {
-    safe_increment();
+void UnpackerImpl<InputIt, float>::unpack_type(Unpacker<InputIt> &u, float &value) {
+  if (u.safe_data() == float32) {
+    u.safe_increment();
     uint32_t data = 0;
     for (auto i = sizeof(uint32_t); i > 0; --i) {
-      data += safe_data() << 8 * (i - 1);
-      safe_increment();
+      data += u.safe_data() << 8 * (i - 1);
+      u.safe_increment();
     }
     auto bits = std::bitset<32>(data);
     auto mantissa = 1.0f;
@@ -896,27 +1021,31 @@ void Unpacker::unpack_type(float &value) {
     exponent -= 127;
     value = ldexp(mantissa, exponent);
   } else {
-    if (safe_data() == int8 || safe_data() == int16 || safe_data() == int32 || safe_data() == int64) {
+    if (u.safe_data() == int8 || u.safe_data() == int16 || u.safe_data() == int32 || u.safe_data() == int64) {
       int64_t val = 0;
-      unpack_type(val);
+      u.unpack_type(val);
       value = float(val);
     } else {
       uint64_t val = 0;
-      unpack_type(val);
+      u.unpack_type(val);
       value = float(val);
     }
   }
 }
 
-template<>
+template<class InputIt>
+struct UnpackerImpl<InputIt, double> {
+  static void unpack_type(Unpacker<InputIt> &u, double &value);
+};
+template<class InputIt>
 inline
-void Unpacker::unpack_type(double &value) {
-  if (safe_data() == float64) {
-    safe_increment();
+void UnpackerImpl<InputIt, double>::unpack_type(Unpacker<InputIt> &u, double &value) {
+  if (u.safe_data() == float64) {
+    u.safe_increment();
     uint64_t data = 0;
     for (auto i = sizeof(uint64_t); i > 0; --i) {
-      data += uint64_t(safe_data()) << 8 * (i - 1);
-      safe_increment();
+      data += uint64_t(u.safe_data()) << 8 * (i - 1);
+      u.safe_increment();
     }
     auto bits = std::bitset<64>(data);
     auto mantissa = 1.0;
@@ -935,81 +1064,81 @@ void Unpacker::unpack_type(double &value) {
     exponent -= 1023;
     value = ldexp(mantissa, exponent);
   } else {
-    if (safe_data() == int8 || safe_data() == int16 || safe_data() == int32 || safe_data() == int64) {
+    if (u.safe_data() == int8 || u.safe_data() == int16 || u.safe_data() == int32 || u.safe_data() == int64) {
       int64_t val = 0;
-      unpack_type(val);
+      u.unpack_type(val);
       value = float(val);
     } else {
       uint64_t val = 0;
-      unpack_type(val);
+      u.unpack_type(val);
       value = float(val);
     }
   }
 }
 
-template<>
+template<class InputIt>
+struct UnpackerImpl<InputIt, std::string> {
+  static void unpack_type(Unpacker<InputIt> &u, std::string &value);
+};
+template<class InputIt>
 inline
-void Unpacker::unpack_type(std::string &value) {
+void UnpackerImpl<InputIt, std::string>::unpack_type(Unpacker<InputIt> &u, std::string &value) {
   std::size_t str_size = 0;
-  if (safe_data() == str32) {
-    safe_increment();
+  if (u.safe_data() == str32) {
+    u.safe_increment();
     for (auto i = sizeof(uint32_t); i > 0; --i) {
-      str_size += uint32_t(safe_data()) << 8 * (i - 1);
-      safe_increment();
+      str_size += uint32_t(u.safe_data()) << 8 * (i - 1);
+      u.safe_increment();
     }
-  } else if (safe_data() == str16) {
-    safe_increment();
+  } else if (u.safe_data() == str16) {
+    u.safe_increment();
     for (auto i = sizeof(uint16_t); i > 0; --i) {
-      str_size += uint16_t(safe_data()) << 8 * (i - 1);
-      safe_increment();
+      str_size += uint16_t(u.safe_data()) << 8 * (i - 1);
+      u.safe_increment();
     }
-  } else if (safe_data() == str8) {
-    safe_increment();
+  } else if (u.safe_data() == str8) {
+    u.safe_increment();
     for (auto i = sizeof(uint8_t); i > 0; --i) {
-      str_size += uint8_t(safe_data()) << 8 * (i - 1);
-      safe_increment();
+      str_size += uint8_t(u.safe_data()) << 8 * (i - 1);
+      u.safe_increment();
     }
   } else {
-    str_size = safe_data() & 0b00011111;
-    safe_increment();
+    str_size = u.safe_data() & 0b00011111;
+    u.safe_increment();
   }
-  if (data_pointer + str_size <= data_end) {
-    value = std::string{data_pointer, data_pointer + str_size};
-    safe_increment(str_size);
-  } else {
-    ec = UnpackerError::OutOfRange;
-  }
+  value = std::string{};
+  u.safe_append(value, str_size);
 }
 
-template<>
+template<class InputIt>
+struct UnpackerImpl<InputIt, std::vector<uint8_t>> {
+  static void unpack_type(Unpacker<InputIt> &u, std::vector<uint8_t> &value);
+};
+template<class InputIt>
 inline
-void Unpacker::unpack_type(std::vector<uint8_t> &value) {
+void UnpackerImpl<InputIt, std::vector<uint8_t>>::unpack_type(Unpacker<InputIt> &u, std::vector<uint8_t> &value) {
   std::size_t bin_size = 0;
-  if (safe_data() == bin32) {
-    safe_increment();
+  if (u.safe_data() == bin32) {
+    u.safe_increment();
     for (auto i = sizeof(uint32_t); i > 0; --i) {
-      bin_size += uint32_t(safe_data()) << 8 * (i - 1);
-      safe_increment();
+      bin_size += uint32_t(u.safe_data()) << 8 * (i - 1);
+      u.safe_increment();
     }
-  } else if (safe_data() == bin16) {
-    safe_increment();
+  } else if (u.safe_data() == bin16) {
+    u.safe_increment();
     for (auto i = sizeof(uint16_t); i > 0; --i) {
-      bin_size += uint16_t(safe_data()) << 8 * (i - 1);
-      safe_increment();
+      bin_size += uint16_t(u.safe_data()) << 8 * (i - 1);
+      u.safe_increment();
     }
   } else {
-    safe_increment();
+    u.safe_increment();
     for (auto i = sizeof(uint8_t); i > 0; --i) {
-      bin_size += uint8_t(safe_data()) << 8 * (i - 1);
-      safe_increment();
+      bin_size += uint8_t(u.safe_data()) << 8 * (i - 1);
+      u.safe_increment();
     }
   }
-  if (data_pointer + bin_size <= data_end) {
-    value = std::vector<uint8_t>{data_pointer, data_pointer + bin_size};
-    safe_increment(bin_size);
-  } else {
-    ec = UnpackerError::OutOfRange;
-  }
+  value = std::vector<uint8_t>{};
+  u.safe_append(value, bin_size);
 }
 
 template<class PackableObject>
@@ -1026,30 +1155,35 @@ std::vector<uint8_t> pack(PackableObject &&obj) {
   return packer.vector();
 }
 
-template<class UnpackableObject>
-UnpackableObject unpack(const uint8_t *data_start, const std::size_t size, std::error_code &ec) {
+template<class UnpackableObject, class InputIt>
+UnpackableObject unpack(InputIt begin, InputIt end, std::error_code &ec) {
   auto obj = UnpackableObject{};
-  auto unpacker = Unpacker(data_start, size);
+  auto unpacker = Unpacker(begin, end);
   obj.pack(unpacker);
   ec = unpacker.ec;
   return obj;
 }
 
 template<class UnpackableObject>
+UnpackableObject unpack(const uint8_t *data_start, const std::size_t size, std::error_code &ec) {
+  return unpack<UnpackableObject>(data_start, data_start + size, ec);
+}
+
+template<class UnpackableObject>
 UnpackableObject unpack(const uint8_t *data_start, const std::size_t size) {
   std::error_code ec{};
-  return unpack<UnpackableObject>(data_start, size, ec);
+  return unpack<UnpackableObject>(data_start, data_start + size, ec);
 }
 
 template<class UnpackableObject>
 UnpackableObject unpack(const std::vector<uint8_t> &data, std::error_code &ec) {
-  return unpack<UnpackableObject>(data.data(), data.size(), ec);
+  return unpack<UnpackableObject>(data.begin(), data.end(), ec);
 }
 
 template<class UnpackableObject>
 UnpackableObject unpack(const std::vector<uint8_t> &data) {
   std::error_code ec;
-  return unpack<UnpackableObject>(data.data(), data.size(), ec);
+  return unpack<UnpackableObject>(data.begin(), data.end(), ec);
 }
 }
 

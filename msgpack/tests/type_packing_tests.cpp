@@ -15,7 +15,7 @@ TEST_CASE("Nil type packing") {
 
 TEST_CASE("Boolean type packing") {
   auto packer = msgpack::Packer{};
-  auto unpacker = msgpack::Unpacker{};
+  auto unpacker = msgpack::Unpacker<const uint8_t *>{};
   auto bool_obj = false;
   packer.process(bool_obj);
   unpacker.set_data(packer.vector().data(), packer.vector().size());
@@ -36,7 +36,7 @@ TEST_CASE("Boolean type packing") {
 
 TEST_CASE("Integer type packing") {
   auto packer = msgpack::Packer{};
-  auto unpacker = msgpack::Unpacker{};
+  auto unpacker = msgpack::Unpacker<const uint8_t *>{};
 
   for (auto i = 0U; i < 10; ++i) {
     uint8_t test_num = i * (std::numeric_limits<uint8_t>::max() / 10);
@@ -121,7 +121,7 @@ TEST_CASE("Integer type packing") {
 
 TEST_CASE("Chrono type packing") {
   auto packer = msgpack::Packer{};
-  auto unpacker = msgpack::Unpacker{};
+  auto unpacker = msgpack::Unpacker<const uint8_t *>{};
 
   auto test_time_point = std::chrono::steady_clock::now();
   auto test_time_point_copy = test_time_point;
@@ -136,7 +136,7 @@ TEST_CASE("Chrono type packing") {
 
 TEST_CASE("Float type packing") {
   auto packer = msgpack::Packer{};
-  auto unpacker = msgpack::Unpacker{};
+  auto unpacker = msgpack::Unpacker<const uint8_t *>{};
 
   for (auto i = -5; i < 5; ++i) {
     float test_num = 5.0f + float(i) * 12345.67f / 4.56f;
@@ -161,7 +161,7 @@ TEST_CASE("Float type packing") {
 
 TEST_CASE("String type packing") {
   auto packer = msgpack::Packer{};
-  auto unpacker = msgpack::Unpacker{};
+  auto unpacker = msgpack::Unpacker<const uint8_t *>{};
 
   auto str1 = std::string("test");
   packer.process(str1);
@@ -174,7 +174,7 @@ TEST_CASE("String type packing") {
 
 TEST_CASE("Byte array type packing") {
   auto packer = msgpack::Packer{};
-  auto unpacker = msgpack::Unpacker{};
+  auto unpacker = msgpack::Unpacker<const uint8_t *>{};
 
   auto vec1 = std::vector<uint8_t>{1, 2, 3, 4};
   packer.process(vec1);
@@ -187,7 +187,7 @@ TEST_CASE("Byte array type packing") {
 
 TEST_CASE("Array type packing") {
   auto packer = msgpack::Packer{};
-  auto unpacker = msgpack::Unpacker{};
+  auto unpacker = msgpack::Unpacker<const uint8_t *>{};
 
   auto list1 = std::list<std::string>{"one", "two", "three"};
   packer.process(list1);
@@ -202,7 +202,7 @@ TEST_CASE("Array type packing") {
 
 TEST_CASE("std::array type packing") {
   auto packer = msgpack::Packer{};
-  auto unpacker = msgpack::Unpacker{};
+  auto unpacker = msgpack::Unpacker<const uint8_t *>{};
 
   auto arr = std::array<std::string, 3>{"one", "two", "three"};
   packer.process(arr);
@@ -217,7 +217,7 @@ TEST_CASE("std::array type packing") {
 
 TEST_CASE("Map type packing") {
   auto packer = msgpack::Packer{};
-  auto unpacker = msgpack::Unpacker{};
+  auto unpacker = msgpack::Unpacker<const uint8_t *>{};
 
   auto map1 = std::map<uint8_t, std::string>{std::make_pair(0, "zero"), std::make_pair(1, "one")};
   packer.process(map1);
@@ -231,7 +231,7 @@ TEST_CASE("Map type packing") {
 
 TEST_CASE("Unordered map packing") {
   auto packer = msgpack::Packer{};
-  auto unpacker = msgpack::Unpacker{};
+  auto unpacker = msgpack::Unpacker<const uint8_t *>{};
 
   auto map1 = std::unordered_map<uint8_t, std::string>{std::make_pair(0, "zero"), std::make_pair(1, "one")};
   auto map_copy = map1;
