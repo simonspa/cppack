@@ -196,6 +196,8 @@ class Packer {
       pack_map(value);
     } else if constexpr (is_container<T>::value || is_stdarray<T>::value) {
       pack_array(value);
+    } else if constexpr (std::is_enum_v<T>) {
+      pack_enum(value);
     } else {
       auto recursive_packer = Packer{};
       const_cast<T &>(value).pack(recursive_packer);
@@ -251,6 +253,11 @@ class Packer {
       pack_type(std::get<0>(elem));
       pack_type(std::get<1>(elem));
     }
+  }
+
+  template<class T>
+  void pack_enum(const T &_enum) {
+    pack_type(static_cast<std::underlying_type_t<T>>(_enum));
   }
 
   std::bitset<64> twos_complement(int64_t value) {
@@ -536,6 +543,8 @@ struct UnpackerImpl {
   static void unpack_stdarray(Unpacker<InputIt> &u, T &array);
 
   static void unpack_map(Unpacker<InputIt> &u, T &map);
+
+  static void unpack_enum(Unpacker<InputIt> &u, T &_enum);
 };
 
 template<class InputIt>
@@ -636,6 +645,8 @@ void UnpackerImpl<InputIt, T>::unpack_type(Unpacker<InputIt> &u, T &value) {
     unpack_array(u, value);
   } else if constexpr (is_stdarray<T>::value) {
     unpack_stdarray(u, value);
+  } else if constexpr (std::is_enum_v<T>) {
+    unpack_enum(u, value);
   } else {
     auto recursive_data = std::vector<uint8_t>{};
     u.unpack_type(recursive_data);
@@ -747,6 +758,13 @@ void UnpackerImpl<InputIt, T>::unpack_map(Unpacker<InputIt> &u, T &map) {
       map.insert_or_assign(key, value);
     }
   }
+}
+
+template<class InputIt, class T>
+void UnpackerImpl<InputIt, T>::unpack_enum(Unpacker<InputIt> &u, T &map) {
+  std::underlying_type_t<T> val;
+  u.unpack_type(val);
+  map = static_cast<T>(val);
 }
 
 template<class InputIt>
