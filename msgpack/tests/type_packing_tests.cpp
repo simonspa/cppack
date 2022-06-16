@@ -78,6 +78,17 @@ TEST_CASE("Integer type packing") {
     REQUIRE(x == test_num);
   }
 
+  {
+    std::array<uint64_t, 2> test_num = {65537, 65537};
+    packer.clear();
+    packer.process(test_num);
+    std::array<uint64_t, 2> x;
+    unpacker.set_data(packer.vector().data(), packer.vector().size());
+    unpacker.process(x);
+    REQUIRE(x[0] == 65537);
+    REQUIRE(x[1] == 65537);
+  }
+
   for (auto i = -5; i < 5; ++i) {
     int8_t test_num = i * (std::numeric_limits<int8_t>::max() / 5);
     packer.clear();
